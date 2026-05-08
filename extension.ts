@@ -505,34 +505,47 @@ function createServer(): http.Server {
 export default function (pi: ExtensionAPI): void {
   let server: http.Server | null = null;
 
+  console.log("[pi-serve] extension loaded, registering session_start handler");
+
   pi.on("session_start", async (_event, ctx) => {
+    console.log("[pi-serve] session_start fired");
     piApi = pi;
 
     // Resolve active model from context
+    console.log("[pi-serve] ctx.model:", ctx.model);
     if (ctx.model) {
       activeModel = ctx.model.id;
+      console.log("[pi-serve] active model set to:", activeModel);
+    } else {
+      console.log("[pi-serve] no model on ctx, activeModel stays:", activeModel);
     }
 
     // Start HTTP server
+    console.log(`[pi-serve] creating HTTP server on port ${PORT}...`);
     server = createServer();
-    server.listen(PORT, "127.0.0.1", () => {
-      console.log(`[pi-serve] HTTP server listening on http://127.0.0.1:${PORT}`);
-    });
 
     server.on("error", (err: NodeJS.ErrnoException) => {
+      console.error("[pi-serve] server error event:", err.code, err.message);
       if (err.code === "EADDRINUSE") {
         console.error(`[pi-serve] Port ${PORT} already in use — server not started`);
-      } else {
-        console.error("[pi-serve] Server error:", err);
       }
     });
+
+    server.listen(PORT, "127.0.0.1", () => {
+      const addr = server?.address();
+      console.log(`[pi-serve] HTTP server listening — address:`, addr);
+    });
+
+    console.log("[pi-serve] server.listen() called, waiting for callback...");
   });
 
   pi.on("model_select", (event: { model: { id: string } }) => {
+    console.log("[pi-serve] model_select:", event.model.id);
     activeModel = event.model.id;
   });
 
   pi.on("session_shutdown", () => {
+    console.log("[pi-serve] session_shutdown fired, closing server");
     piApi = null;
 
     // Drain queue with errors
@@ -547,4 +560,6 @@ export default function (pi: ExtensionAPI): void {
       server = null;
     }
   });
+
+  console.log("[pi-serve] extension setup complete");
 }
