@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-05-08
+
+### Fixed
+- Extension never loaded: `package.json` was missing the `"pi"` manifest key, so pi couldn't discover `extension.ts` at the package root
+- Listener accumulation: `message_update` and `agent_end` handlers are now registered once at factory load time instead of once per request — no `pi.on()` leak
+- Model ID format: now reported as `provider/id` (e.g. `github-copilot/claude-sonnet-4.6`) instead of bare `id`
+- Available models for `/api/tags` now populated from `ctx.modelRegistry.getAvailable()` at session start
+
 ## [1.0.0] - 2026-05-08
 
 ### Added
