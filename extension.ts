@@ -34,6 +34,7 @@ let availableModels: Array<{ id: string; provider: string }> = [];
 let requestQueue: QueuedRequest[] = [];
 let isProcessing = false;
 let currentRequest: QueuedRequest | null = null;
+let piIsStreaming = false;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -342,6 +343,10 @@ export default function (pi: ExtensionAPI): void {
       isProcessing = false;
       return;
     }
+    if (piIsStreaming) {
+      // pi is busy (TUI or previous request still running); agent_end will call us again
+      return;
+    }
     isProcessing = true;
     currentRequest = requestQueue.shift()!;
     pi.sendUserMessage(currentRequest.userMessage);
@@ -354,6 +359,10 @@ export default function (pi: ExtensionAPI): void {
 
   // --- Permanent listeners registered once per extension load ---
 
+  pi.on("agent_start", (_event, _ctx) => {
+    piIsStreaming = true;
+  });
+
   pi.on("message_update", (event, _ctx) => {
     if (!currentRequest) return;
     if (event.assistantMessageEvent.type === "text_delta") {
@@ -362,10 +371,14 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", (_event, _ctx) => {
-    if (!currentRequest) return;
-    const req = currentRequest;
-    currentRequest = null;
-    req.onEnd();
+    piIsStreaming = false;
+    // Settle the current HTTP request if there is one
+    if (currentRequest) {
+      const req = currentRequest;
+      currentRequest = null;
+      req.onEnd();
+    }
+    // Always try to advance the queue — handles TUI-triggered completions too
     processNext();
   });
 
@@ -383,11 +396,15 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", (_event, _ctx) => {
-    // Drain queue
+    // Drain in-flight request and queue
+    if (currentRequest) {
+      currentRequest.onError("session shutting down");
+      currentRequest = null;
+    }
     for (const req of requestQueue) req.onError("session shutting down");
     requestQueue = [];
     isProcessing = false;
-    currentRequest = null;
+    piIsStreaming = false;
 
     if (server) {
       server.close();
@@ -426,12 +443,14 @@ export default function (pi: ExtensionAPI): void {
         server = createServer(enqueue);
 
         server.on("error", (err: NodeJS.ErrnoException) => {
-          if (err.code === "EADDRINUSE") {
-            ctx.ui.notify(`pi-serve: port ${PORT} already in use`, "error");
-          } else {
-            ctx.ui.notify(`pi-serve error: ${err.message}`, "error");
-          }
+          const failed = server;
           server = null;
+          failed?.close();
+          if (err.code === "EADDRINUSE") {
+            ctx.ui.notify(`pi-serve: port ${PORT} already in use — free it and run /server start again`, "error");
+          } else {
+            ctx.ui.notify(`pi-serve: ${err.message}`, "error");
+          }
         });
 
         server.listen(PORT, "127.0.0.1", () => {
@@ -444,10 +463,14 @@ export default function (pi: ExtensionAPI): void {
           return;
         }
 
+        // Drain in-flight request first, then the queue
+        if (currentRequest) {
+          currentRequest.onError("server stopped");
+          currentRequest = null;
+        }
         for (const req of requestQueue) req.onError("server stopped");
         requestQueue = [];
         isProcessing = false;
-        currentRequest = null;
 
         server.close();
         server = null;
