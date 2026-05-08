@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-05-08
+
+### Changed
+- Server no longer auto-starts on `session_start`. Use `/server start` and `/server stop` to control it manually
+- `/server` command with `start`/`stop` argument autocomplete
+- Errors (port in use, etc.) now surface as pi UI notifications
+- Footer shows `serving at :31416` while the server is active, clears on stop or session shutdown
+
+### Fixed
+- TUI interference race condition: `piIsStreaming` flag (via `agent_start`/`agent_end`) prevents `sendUserMessage` being called while pi is busy with a TUI turn
+- `agent_end` now always advances the request queue, including after TUI-triggered completions
+- `/server stop` now drains the in-flight `currentRequest` before closing, not just the pending queue
+- `session_shutdown` resets `piIsStreaming` and clears the footer status
+
 ## [1.2.0] - 2026-05-08
 
 ### Changed
