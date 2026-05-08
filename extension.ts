@@ -12,7 +12,7 @@ import * as crypto from "node:crypto";
 // ---------------------------------------------------------------------------
 
 const PORT = 31416;
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -376,32 +376,10 @@ export default function (pi: ExtensionAPI): void {
   // --- Session lifecycle ---
 
   pi.on("session_start", async (_event, ctx) => {
-    // Capture active model
+    // Track active model — server is started manually via /server start
     if (ctx.model) {
       activeModel = `${ctx.model.provider}/${ctx.model.id}`;
     }
-
-    // Populate full model list
-    try {
-      availableModels = await ctx.modelRegistry.getAvailable();
-    } catch {
-      availableModels = [];
-    }
-
-    // Start HTTP server
-    server = createServer(enqueue);
-
-    server.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        console.error(`[pi-serve] port ${PORT} already in use`);
-      } else {
-        console.error("[pi-serve] server error:", err.message);
-      }
-    });
-
-    server.listen(PORT, "127.0.0.1", () => {
-      console.log(`[pi-serve] listening on http://127.0.0.1:${PORT} (model: ${activeModel})`);
-    });
   });
 
   pi.on("session_shutdown", (_event, _ctx) => {
@@ -415,5 +393,69 @@ export default function (pi: ExtensionAPI): void {
       server.close();
       server = null;
     }
+  });
+
+  // --- /server command ---
+
+  pi.registerCommand("server", {
+    description: "Start or stop the pi-serve HTTP server",
+    getArgumentCompletions: (prefix) => {
+      return ["start", "stop"]
+        .filter((s) => s.startsWith(prefix))
+        .map((s) => ({ value: s, label: s }));
+    },
+    handler: async (args, ctx) => {
+      const action = args.trim();
+
+      if (action === "start") {
+        if (server) {
+          ctx.ui.notify(`pi-serve already running on port ${PORT}`, "warning");
+          return;
+        }
+
+        // Refresh model list and active model
+        if (ctx.model) {
+          activeModel = `${ctx.model.provider}/${ctx.model.id}`;
+        }
+        try {
+          availableModels = await ctx.modelRegistry.getAvailable();
+        } catch {
+          availableModels = [];
+        }
+
+        server = createServer(enqueue);
+
+        server.on("error", (err: NodeJS.ErrnoException) => {
+          if (err.code === "EADDRINUSE") {
+            ctx.ui.notify(`pi-serve: port ${PORT} already in use`, "error");
+          } else {
+            ctx.ui.notify(`pi-serve error: ${err.message}`, "error");
+          }
+          server = null;
+        });
+
+        server.listen(PORT, "127.0.0.1", () => {
+          ctx.ui.notify(`pi-serve listening on http://127.0.0.1:${PORT}`, "info");
+        });
+
+      } else if (action === "stop") {
+        if (!server) {
+          ctx.ui.notify("pi-serve is not running", "warning");
+          return;
+        }
+
+        for (const req of requestQueue) req.onError("server stopped");
+        requestQueue = [];
+        isProcessing = false;
+        currentRequest = null;
+
+        server.close();
+        server = null;
+        ctx.ui.notify("pi-serve stopped", "info");
+
+      } else {
+        ctx.ui.notify("Usage: /server start | stop", "warning");
+      }
+    },
   });
 }

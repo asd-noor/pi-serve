@@ -20,11 +20,14 @@ Then `/reload` in pi.
 
 ## Usage
 
-Start pi normally — the server starts automatically on `session_start` and shuts down on `session_shutdown`.
+Start pi normally, then use `/server start` to start the HTTP server on demand:
 
 ```
-[pi-serve] listening on http://127.0.0.1:31416 (model: github-copilot/claude-sonnet-4.6)
+/server start
+/server stop
 ```
+
+The server is **not** started automatically. Use `/server stop` to shut it down without exiting pi.
 
 The port is **31416** (π × 10 000).
 
