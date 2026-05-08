@@ -3,6 +3,7 @@ import type {
   AgentEndEvent,
   SessionStartEvent,
   ExtensionContext,
+  ExtensionUIContext,
 } from "@mariozechner/pi-coding-agent";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
@@ -35,6 +36,7 @@ let requestQueue: QueuedRequest[] = [];
 let isProcessing = false;
 let currentRequest: QueuedRequest | null = null;
 let piIsStreaming = false;
+let ui: ExtensionUIContext | null = null;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -389,6 +391,7 @@ export default function (pi: ExtensionAPI): void {
   // --- Session lifecycle ---
 
   pi.on("session_start", async (_event, ctx) => {
+    ui = ctx.ui;
     // Track active model — server is started manually via /server start
     if (ctx.model) {
       activeModel = `${ctx.model.provider}/${ctx.model.id}`;
@@ -410,6 +413,8 @@ export default function (pi: ExtensionAPI): void {
       server.close();
       server = null;
     }
+    ui?.setStatus("pi-serve", undefined);
+    ui = null;
   });
 
   // --- /server command ---
@@ -455,6 +460,7 @@ export default function (pi: ExtensionAPI): void {
 
         server.listen(PORT, "127.0.0.1", () => {
           ctx.ui.notify(`pi-serve listening on http://127.0.0.1:${PORT}`, "info");
+          ctx.ui.setStatus("pi-serve", `serving at :${PORT}`);
         });
 
       } else if (action === "stop") {
@@ -474,6 +480,7 @@ export default function (pi: ExtensionAPI): void {
 
         server.close();
         server = null;
+        ctx.ui.setStatus("pi-serve", undefined);
         ctx.ui.notify("pi-serve stopped", "info");
 
       } else {
