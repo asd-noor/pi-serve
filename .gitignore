@@ -1,0 +1,6 @@
+.pi-memory/
+node_modules/
+dist/
+*.js
+*.d.ts
+*.js.map
