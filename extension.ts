@@ -1,4 +1,9 @@
-import type { ExtensionAPI, ExtensionContext, AgentEndEvent } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  AgentEndEvent,
+  SessionStartEvent,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 
@@ -10,7 +15,7 @@ const PORT = 31416;
 const VERSION = "1.0.0";
 
 // ---------------------------------------------------------------------------
-// Request queue types
+// Types
 // ---------------------------------------------------------------------------
 
 interface QueuedRequest {
@@ -21,93 +26,14 @@ interface QueuedRequest {
 }
 
 // ---------------------------------------------------------------------------
-// Module-level state
+// Module-level state (reset on session_shutdown)
 // ---------------------------------------------------------------------------
 
 let activeModel = "unknown";
+let availableModels: Array<{ id: string; provider: string }> = [];
 let requestQueue: QueuedRequest[] = [];
 let isProcessing = false;
-let piApi: ExtensionAPI | null = null;
-
-// Subscribed listener unsubscribe functions for the current in-flight request
-let unsubMessageUpdate: (() => void) | null = null;
-let unsubAgentEnd: (() => void) | null = null;
-
-// ---------------------------------------------------------------------------
-// Queue helpers
-// ---------------------------------------------------------------------------
-
-function processNext(): void {
-  if (requestQueue.length === 0) {
-    isProcessing = false;
-    return;
-  }
-  isProcessing = true;
-  const req = requestQueue.shift()!;
-
-  // Unsubscribe any stale listeners (safety guard)
-  unsubMessageUpdate?.();
-  unsubAgentEnd?.();
-  unsubMessageUpdate = null;
-  unsubAgentEnd = null;
-
-  if (!piApi) {
-    req.onError("pi API not available");
-    processNext();
-    return;
-  }
-
-  // Register one-shot listeners
-  const onUpdate = (event: { assistantMessageEvent: { type: string; delta?: string } }, _ctx: ExtensionContext) => {
-    if (
-      event.assistantMessageEvent.type === "text_delta" &&
-      event.assistantMessageEvent.delta
-    ) {
-      req.onDelta(event.assistantMessageEvent.delta);
-    }
-  };
-
-  const onEnd = (_event: AgentEndEvent, _ctx: ExtensionContext) => {
-    // Tear down listeners
-    unsubMessageUpdate?.();
-    unsubAgentEnd?.();
-    unsubMessageUpdate = null;
-    unsubAgentEnd = null;
-    req.onEnd();
-    // Process next item in queue
-    processNext();
-  };
-
-  // pi.on returns void but the runner uses the registered handlers array;
-  // we capture them for manual removal via wrapper arrays.
-  // pi doesn't expose an "off" yet — use a closed-over flag to make them
-  // effectively one-shot.
-  let done = false;
-
-  const guardedUpdate = (event: { assistantMessageEvent: { type: string; delta?: string } }, ctx: ExtensionContext) => {
-    if (!done) onUpdate(event, ctx);
-  };
-  const guardedEnd = (event: AgentEndEvent, ctx: ExtensionContext) => {
-    if (done) return;
-    done = true;
-    onEnd(event, ctx);
-  };
-
-  // Store no-ops as "unsubscribe" — since pi has no off(), we rely on the
-  // done flag to ignore subsequent firings after the request completes.
-  unsubMessageUpdate = () => { done = true; };
-  unsubAgentEnd = () => { done = true; };
-
-  piApi.on("message_update", guardedUpdate);
-  piApi.on("agent_end", guardedEnd);
-
-  piApi.sendUserMessage(req.userMessage);
-}
-
-function enqueue(req: QueuedRequest): void {
-  requestQueue.push(req);
-  if (!isProcessing) processNext();
-}
+let currentRequest: QueuedRequest | null = null;
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
@@ -157,11 +83,7 @@ function parseBodyJson(raw: string): unknown {
 // ---------------------------------------------------------------------------
 
 function handleGetRoot(res: http.ServerResponse): void {
-  sendJson(res, 200, {
-    status: "ok",
-    model: activeModel,
-    port: PORT,
-  });
+  sendJson(res, 200, { status: "ok", model: activeModel, port: PORT });
 }
 
 function handleGetVersion(res: http.ServerResponse): void {
@@ -169,42 +91,44 @@ function handleGetVersion(res: http.ServerResponse): void {
 }
 
 function handleGetTags(res: http.ServerResponse): void {
-  sendJson(res, 200, {
-    models: [
-      {
-        name: activeModel,
-        model: activeModel,
+  const models = availableModels.length > 0
+    ? availableModels.map((m) => ({
+        name: `${m.provider}/${m.id}`,
+        model: `${m.provider}/${m.id}`,
         modified_at: "2026-01-01T00:00:00Z",
         size: 0,
         digest: "",
-        details: {
-          family: activeModel.split("/")[0] ?? "unknown",
-          parameter_size: "unknown",
+        details: { family: m.provider, parameter_size: "unknown" },
+      }))
+    : [
+        {
+          name: activeModel,
+          model: activeModel,
+          modified_at: "2026-01-01T00:00:00Z",
+          size: 0,
+          digest: "",
+          details: { family: activeModel.split("/")[0] ?? "unknown", parameter_size: "unknown" },
         },
-      },
-    ],
-  });
+      ];
+  sendJson(res, 200, { models });
 }
 
 function handlePostShow(res: http.ServerResponse): void {
   const parts = activeModel.split("/");
   sendJson(res, 200, {
-    model_info: {
-      name: activeModel,
-      provider: parts[0] ?? "unknown",
-    },
+    model_info: { name: activeModel, provider: parts[0] ?? "unknown" },
   });
 }
 
-// POST /api/generate
 async function handlePostGenerate(
   req: http.IncomingMessage,
-  res: http.ServerResponse
+  res: http.ServerResponse,
+  enqueue: (r: QueuedRequest) => void
 ): Promise<void> {
   const raw = await readBody(req);
   const body = parseBodyJson(raw) as Record<string, unknown>;
   const prompt = typeof body.prompt === "string" ? body.prompt : "";
-  const stream = body.stream !== false; // default true
+  const stream = body.stream !== false;
 
   if (!prompt) {
     sendJson(res, 400, { error: "prompt is required" });
@@ -213,69 +137,41 @@ async function handlePostGenerate(
 
   if (stream) {
     res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-
     enqueue({
       userMessage: prompt,
       onDelta: (delta) => {
-        const chunk = JSON.stringify({
-          model: activeModel,
-          created_at: isoNow(),
-          response: delta,
-          done: false,
-        });
-        res.write(chunk + "\n");
+        res.write(JSON.stringify({ model: activeModel, created_at: isoNow(), response: delta, done: false }) + "\n");
       },
       onEnd: () => {
-        const final = JSON.stringify({
-          model: activeModel,
-          created_at: isoNow(),
-          response: "",
-          done: true,
-          done_reason: "stop",
-        });
-        res.write(final + "\n");
+        res.write(JSON.stringify({ model: activeModel, created_at: isoNow(), response: "", done: true, done_reason: "stop" }) + "\n");
         res.end();
       },
       onError: (err) => {
-        const errChunk = JSON.stringify({ error: err, done: true });
-        res.write(errChunk + "\n");
+        res.write(JSON.stringify({ error: err, done: true }) + "\n");
         res.end();
       },
     });
   } else {
-    // Non-streaming: buffer all deltas
-    const buffers: string[] = [];
-
+    const buf: string[] = [];
     enqueue({
       userMessage: prompt,
-      onDelta: (delta) => buffers.push(delta),
-      onEnd: () => {
-        sendJson(res, 200, {
-          model: activeModel,
-          created_at: isoNow(),
-          response: buffers.join(""),
-          done: true,
-          done_reason: "stop",
-        });
-      },
-      onError: (err) => {
-        sendJson(res, 500, { error: err });
-      },
+      onDelta: (delta) => buf.push(delta),
+      onEnd: () => sendJson(res, 200, { model: activeModel, created_at: isoNow(), response: buf.join(""), done: true, done_reason: "stop" }),
+      onError: (err) => sendJson(res, 500, { error: err }),
     });
   }
 }
 
-// POST /api/chat
 async function handlePostChat(
   req: http.IncomingMessage,
-  res: http.ServerResponse
+  res: http.ServerResponse,
+  enqueue: (r: QueuedRequest) => void
 ): Promise<void> {
   const raw = await readBody(req);
   const body = parseBodyJson(raw) as Record<string, unknown>;
-  const messages = Array.isArray(body.messages) ? body.messages as Array<Record<string, unknown>> : [];
-  const stream = body.stream !== false; // default true
+  const messages = Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : [];
+  const stream = body.stream !== false;
 
-  // Extract last user message
   let userMessage = "";
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
@@ -292,70 +188,43 @@ async function handlePostChat(
 
   if (stream) {
     res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-
     enqueue({
       userMessage,
       onDelta: (delta) => {
-        const chunk = JSON.stringify({
-          model: activeModel,
-          created_at: isoNow(),
-          message: { role: "assistant", content: delta },
-          done: false,
-        });
-        res.write(chunk + "\n");
+        res.write(JSON.stringify({ model: activeModel, created_at: isoNow(), message: { role: "assistant", content: delta }, done: false }) + "\n");
       },
       onEnd: () => {
-        const final = JSON.stringify({
-          model: activeModel,
-          created_at: isoNow(),
-          message: { role: "assistant", content: "" },
-          done: true,
-          done_reason: "stop",
-        });
-        res.write(final + "\n");
+        res.write(JSON.stringify({ model: activeModel, created_at: isoNow(), message: { role: "assistant", content: "" }, done: true, done_reason: "stop" }) + "\n");
         res.end();
       },
       onError: (err) => {
-        const errChunk = JSON.stringify({ error: err, done: true });
-        res.write(errChunk + "\n");
+        res.write(JSON.stringify({ error: err, done: true }) + "\n");
         res.end();
       },
     });
   } else {
-    const buffers: string[] = [];
-
+    const buf: string[] = [];
     enqueue({
       userMessage,
-      onDelta: (delta) => buffers.push(delta),
-      onEnd: () => {
-        sendJson(res, 200, {
-          model: activeModel,
-          created_at: isoNow(),
-          message: { role: "assistant", content: buffers.join("") },
-          done: true,
-          done_reason: "stop",
-        });
-      },
-      onError: (err) => {
-        sendJson(res, 500, { error: err });
-      },
+      onDelta: (delta) => buf.push(delta),
+      onEnd: () => sendJson(res, 200, { model: activeModel, created_at: isoNow(), message: { role: "assistant", content: buf.join("") }, done: true, done_reason: "stop" }),
+      onError: (err) => sendJson(res, 500, { error: err }),
     });
   }
 }
 
-// POST /v1/chat/completions  (OpenAI-compatible)
 async function handleOpenAICompletions(
   req: http.IncomingMessage,
-  res: http.ServerResponse
+  res: http.ServerResponse,
+  enqueue: (r: QueuedRequest) => void
 ): Promise<void> {
   const raw = await readBody(req);
   const body = parseBodyJson(raw) as Record<string, unknown>;
-  const messages = Array.isArray(body.messages) ? body.messages as Array<Record<string, unknown>> : [];
-  const stream = body.stream === true; // default false for OpenAI compat
+  const messages = Array.isArray(body.messages) ? (body.messages as Array<Record<string, unknown>>) : [];
+  const stream = body.stream === true;
   const completionId = `chatcmpl-${uuid()}`;
   const created = unixNow();
 
-  // Extract last user message
   let userMessage = "";
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
@@ -372,7 +241,6 @@ async function handleOpenAICompletions(
 
   if (stream) {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-
     enqueue({
       userMessage,
       onDelta: (delta) => {
@@ -381,31 +249,19 @@ async function handleOpenAICompletions(
           object: "chat.completion.chunk",
           created,
           model: activeModel,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant", content: delta },
-              finish_reason: null,
-            },
-          ],
+          choices: [{ index: 0, delta: { role: "assistant", content: delta }, finish_reason: null }],
         });
         res.write(`data: ${chunk}\n\n`);
       },
       onEnd: () => {
-        const finalChunk = JSON.stringify({
+        const final = JSON.stringify({
           id: completionId,
           object: "chat.completion.chunk",
           created,
           model: activeModel,
-          choices: [
-            {
-              index: 0,
-              delta: {},
-              finish_reason: "stop",
-            },
-          ],
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
         });
-        res.write(`data: ${finalChunk}\n\n`);
+        res.write(`data: ${final}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
       },
@@ -415,87 +271,62 @@ async function handleOpenAICompletions(
       },
     });
   } else {
-    const buffers: string[] = [];
-
+    const buf: string[] = [];
     enqueue({
       userMessage,
-      onDelta: (delta) => buffers.push(delta),
+      onDelta: (delta) => buf.push(delta),
       onEnd: () => {
-        const content = buffers.join("");
         sendJson(res, 200, {
           id: completionId,
           object: "chat.completion",
           created,
           model: activeModel,
-          choices: [
-            {
-              index: 0,
-              message: { role: "assistant", content },
-              finish_reason: "stop",
-            },
-          ],
-          usage: {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-          },
+          choices: [{ index: 0, message: { role: "assistant", content: buf.join("") }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
         });
       },
-      onError: (err) => {
-        sendJson(res, 500, { error: { message: err, type: "server_error" } });
-      },
+      onError: (err) => sendJson(res, 500, { error: { message: err, type: "server_error" } }),
     });
   }
 }
 
 // ---------------------------------------------------------------------------
-// Server setup
+// Server factory
 // ---------------------------------------------------------------------------
 
-function createServer(): http.Server {
-  const server = http.createServer(
-    (req: http.IncomingMessage, res: http.ServerResponse) => {
-      // CORS headers for browser clients
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+function createServer(enqueue: (r: QueuedRequest) => void): http.Server {
+  return http.createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-      if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-
-      const url = req.url ?? "/";
-      const method = req.method ?? "GET";
-
-      if (method === "GET" && url === "/") {
-        handleGetRoot(res);
-      } else if (method === "GET" && url === "/api/version") {
-        handleGetVersion(res);
-      } else if (method === "GET" && url === "/api/tags") {
-        handleGetTags(res);
-      } else if (method === "POST" && url === "/api/show") {
-        handlePostShow(res);
-      } else if (method === "POST" && url === "/api/generate") {
-        handlePostGenerate(req, res).catch((err: unknown) => {
-          sendJson(res, 500, { error: String(err) });
-        });
-      } else if (method === "POST" && url === "/api/chat") {
-        handlePostChat(req, res).catch((err: unknown) => {
-          sendJson(res, 500, { error: String(err) });
-        });
-      } else if (method === "POST" && url === "/v1/chat/completions") {
-        handleOpenAICompletions(req, res).catch((err: unknown) => {
-          sendJson(res, 500, { error: String(err) });
-        });
-      } else {
-        sendJson(res, 404, { error: "not found" });
-      }
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
     }
-  );
 
-  return server;
+    const url = req.url ?? "/";
+    const method = req.method ?? "GET";
+
+    if (method === "GET" && url === "/") {
+      handleGetRoot(res);
+    } else if (method === "GET" && url === "/api/version") {
+      handleGetVersion(res);
+    } else if (method === "GET" && url === "/api/tags") {
+      handleGetTags(res);
+    } else if (method === "POST" && url === "/api/show") {
+      handlePostShow(res);
+    } else if (method === "POST" && url === "/api/generate") {
+      handlePostGenerate(req, res, enqueue).catch((err) => sendJson(res, 500, { error: String(err) }));
+    } else if (method === "POST" && url === "/api/chat") {
+      handlePostChat(req, res, enqueue).catch((err) => sendJson(res, 500, { error: String(err) }));
+    } else if (method === "POST" && url === "/v1/chat/completions") {
+      handleOpenAICompletions(req, res, enqueue).catch((err) => sendJson(res, 500, { error: String(err) }));
+    } else {
+      sendJson(res, 404, { error: "not found" });
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -505,61 +336,84 @@ function createServer(): http.Server {
 export default function (pi: ExtensionAPI): void {
   let server: http.Server | null = null;
 
-  console.log("[pi-serve] extension loaded, registering session_start handler");
+  // Queue processing — defined here so it closes over `pi`
+  function processNext(): void {
+    if (requestQueue.length === 0) {
+      isProcessing = false;
+      return;
+    }
+    isProcessing = true;
+    currentRequest = requestQueue.shift()!;
+    pi.sendUserMessage(currentRequest.userMessage);
+  }
+
+  function enqueue(req: QueuedRequest): void {
+    requestQueue.push(req);
+    if (!isProcessing) processNext();
+  }
+
+  // --- Permanent listeners registered once per extension load ---
+
+  pi.on("message_update", (event, _ctx) => {
+    if (!currentRequest) return;
+    if (event.assistantMessageEvent.type === "text_delta") {
+      currentRequest.onDelta(event.assistantMessageEvent.delta);
+    }
+  });
+
+  pi.on("agent_end", (_event, _ctx) => {
+    if (!currentRequest) return;
+    const req = currentRequest;
+    currentRequest = null;
+    req.onEnd();
+    processNext();
+  });
+
+  pi.on("model_select", (event, _ctx) => {
+    activeModel = `${event.model.provider}/${event.model.id}`;
+  });
+
+  // --- Session lifecycle ---
 
   pi.on("session_start", async (_event, ctx) => {
-    console.log("[pi-serve] session_start fired");
-    piApi = pi;
-
-    // Resolve active model from context
-    console.log("[pi-serve] ctx.model:", ctx.model);
+    // Capture active model
     if (ctx.model) {
-      activeModel = ctx.model.id;
-      console.log("[pi-serve] active model set to:", activeModel);
-    } else {
-      console.log("[pi-serve] no model on ctx, activeModel stays:", activeModel);
+      activeModel = `${ctx.model.provider}/${ctx.model.id}`;
+    }
+
+    // Populate full model list
+    try {
+      availableModels = await ctx.modelRegistry.getAvailable();
+    } catch {
+      availableModels = [];
     }
 
     // Start HTTP server
-    console.log(`[pi-serve] creating HTTP server on port ${PORT}...`);
-    server = createServer();
+    server = createServer(enqueue);
 
     server.on("error", (err: NodeJS.ErrnoException) => {
-      console.error("[pi-serve] server error event:", err.code, err.message);
       if (err.code === "EADDRINUSE") {
-        console.error(`[pi-serve] Port ${PORT} already in use — server not started`);
+        console.error(`[pi-serve] port ${PORT} already in use`);
+      } else {
+        console.error("[pi-serve] server error:", err.message);
       }
     });
 
     server.listen(PORT, "127.0.0.1", () => {
-      const addr = server?.address();
-      console.log(`[pi-serve] HTTP server listening — address:`, addr);
+      console.log(`[pi-serve] listening on http://127.0.0.1:${PORT} (model: ${activeModel})`);
     });
-
-    console.log("[pi-serve] server.listen() called, waiting for callback...");
   });
 
-  pi.on("model_select", (event: { model: { id: string } }) => {
-    console.log("[pi-serve] model_select:", event.model.id);
-    activeModel = event.model.id;
-  });
-
-  pi.on("session_shutdown", () => {
-    console.log("[pi-serve] session_shutdown fired, closing server");
-    piApi = null;
-
-    // Drain queue with errors
-    for (const req of requestQueue) {
-      req.onError("session shutting down");
-    }
+  pi.on("session_shutdown", (_event, _ctx) => {
+    // Drain queue
+    for (const req of requestQueue) req.onError("session shutting down");
     requestQueue = [];
     isProcessing = false;
+    currentRequest = null;
 
     if (server) {
       server.close();
       server = null;
     }
   });
-
-  console.log("[pi-serve] extension setup complete");
 }
