@@ -8,7 +8,7 @@
     "pi-package",
     "ollama"
   ],
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "pi": {
     "extensions": ["./extension.ts"]
   },
