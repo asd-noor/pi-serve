@@ -4,7 +4,7 @@ import type {
   SessionStartEvent,
   ExtensionContext,
   ExtensionUIContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import * as http from "node:http";
 import * as crypto from "node:crypto";
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-serve",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Ollama-compatible HTTP server extension for pi coding agent",
   "main": "extension.ts",
   "keywords": [
@@ -13,7 +13,7 @@
     "extensions": ["./extension.ts"]
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "0.73.0",
+    "@earendil-works/pi-coding-agent": "0.74.0",
     "typescript": "^5.9.3"
   }
 }
